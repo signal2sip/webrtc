@@ -5,9 +5,13 @@
 
 #include "rffi/src/audio_device.h"
 
+#include <unordered_map>
+
+#include "absl/base/no_destructor.h"
 #include "api/make_ref_counted.h"
 #include "api/scoped_refptr.h"
 #include "rtc_base/logging.h"
+#include "rtc_base/synchronization/mutex.h"
 
 #define TRACE_LOG \
   RTC_LOG(LS_VERBOSE) << "RingRTCAudioDeviceModule::" << __func__
@@ -17,6 +21,35 @@ namespace rffi {
 
 namespace {
 std::atomic<AudioTransport*> AUDIO_TRANSPORT;
+
+// Per-instance registry backing Rust_rawPcmRecordedDataIsAvailable/
+// Rust_rawPcmNeedMorePlayData below, keyed by the same `adm_borrowed`
+// pointer each RingRTCAudioDeviceModule was constructed with (i.e. the
+// Rust-side ADM instance's own address). AUDIO_TRANSPORT above is a
+// single process-wide slot - fine as long as at most one
+// RingRTCAudioDeviceModule is ever active, which was always true until
+// signal2sip's raw-PCM ADM needed to run N independent instances (one per
+// concurrent call) in a single process; two calls active at once would
+// otherwise have their audio silently cross over whichever instance last
+// called RegisterAudioCallback(). The legacy Rust_recordedDataIsAvailable/
+// Rust_needMorePlayData functions (used by the cubeb-backed audio device
+// path, which signal2sip does not use) are left exactly as they were -
+// only the raw-PCM entry points below are instance-aware.
+//
+// absl::NoDestructor (not a plain function-local static Mutex/map) -
+// Chromium's build treats a static/global with a non-trivial destructor
+// as an error (-Wexit-time-destructors/-Wglobal-constructors); this is
+// the standard WebRTC-codebase pattern for a lazily-constructed, never-
+// destroyed global (see e.g. rtc_base/logging.cc's own LoggingConfig).
+Mutex& RawPcmTransportRegistryMutex() {
+  static absl::NoDestructor<Mutex> mutex;
+  return *mutex;
+}
+
+std::unordered_map<void*, AudioTransport*>& RawPcmTransportRegistry() {
+  static absl::NoDestructor<std::unordered_map<void*, AudioTransport*>> registry;
+  return *registry;
+}
 }
 
 RUSTEXPORT int32_t
@@ -65,6 +98,69 @@ RUSTEXPORT int32_t Rust_needMorePlayData(size_t n_samples,
       *n_samples_out, elapsed_time_ms, ntp_time_ms);
 }
 
+RUSTEXPORT int32_t
+Rust_rawPcmRecordedDataIsAvailable(void* adm_borrowed,
+                                   const void* audio_samples,
+                                   size_t n_samples,
+                                   size_t n_bytes_per_sample,
+                                   size_t n_channels,
+                                   uint32_t samples_per_sec,
+                                   uint32_t total_delay_ms,
+                                   int32_t clock_drift,
+                                   uint32_t current_mic_level,
+                                   bool key_pressed,
+                                   uint32_t* new_mic_level,
+                                   int64_t estimated_capture_time_ns) {
+  AudioTransport* audio_callback = nullptr;
+  {
+    MutexLock lock(&RawPcmTransportRegistryMutex());
+    auto& registry = RawPcmTransportRegistry();
+    auto it = registry.find(adm_borrowed);
+    if (it != registry.end()) {
+      audio_callback = it->second;
+    }
+  }
+  if (!audio_callback) {
+    return 0;
+  }
+  std::optional<int64_t> estimated_capture_time_ns_opt;
+  if (estimated_capture_time_ns >= 0) {
+    estimated_capture_time_ns_opt = estimated_capture_time_ns;
+  }
+  return audio_callback->RecordedDataIsAvailable(
+      audio_samples, n_samples, n_bytes_per_sample, n_channels, samples_per_sec,
+      total_delay_ms, clock_drift, current_mic_level, key_pressed,
+      *new_mic_level, estimated_capture_time_ns_opt);
+}
+
+RUSTEXPORT int32_t
+Rust_rawPcmNeedMorePlayData(void* adm_borrowed,
+                            size_t n_samples,
+                            size_t n_bytes_per_sample,
+                            size_t n_channels,
+                            uint32_t samples_per_sec,
+                            void* audio_samples,
+                            size_t* n_samples_out,
+                            int64_t* elapsed_time_ms,
+                            int64_t* ntp_time_ms) {
+  AudioTransport* audio_callback = nullptr;
+  {
+    MutexLock lock(&RawPcmTransportRegistryMutex());
+    auto& registry = RawPcmTransportRegistry();
+    auto it = registry.find(adm_borrowed);
+    if (it != registry.end()) {
+      audio_callback = it->second;
+    }
+  }
+  if (!audio_callback) {
+    *n_samples_out = n_samples;
+    return 0;
+  }
+  return audio_callback->NeedMorePlayData(
+      n_samples, n_bytes_per_sample, n_channels, samples_per_sec, audio_samples,
+      *n_samples_out, elapsed_time_ms, ntp_time_ms);
+}
+
 RingRTCAudioDeviceModule::RingRTCAudioDeviceModule(
     void* adm_borrowed,
     const AudioDeviceCallbacks* callbacks)
@@ -77,6 +173,10 @@ RingRTCAudioDeviceModule::RingRTCAudioDeviceModule(
 RingRTCAudioDeviceModule::~RingRTCAudioDeviceModule() {
   TRACE_LOG;
   RTC_DCHECK_RUN_ON(&thread_checker_);
+  {
+    MutexLock lock(&RawPcmTransportRegistryMutex());
+    RawPcmTransportRegistry().erase(adm_borrowed_);
+  }
   Terminate();
 }
 
@@ -111,6 +211,21 @@ int32_t RingRTCAudioDeviceModule::RegisterAudioCallback(
   }
 
   AUDIO_TRANSPORT.store(audio_callback, std::memory_order_seq_cst);
+
+  // Keep the per-instance registry (Rust_rawPcmRecordedDataIsAvailable/
+  // Rust_rawPcmNeedMorePlayData above) in sync too - cheap to maintain
+  // unconditionally regardless of which Rust-side ADM implementation this
+  // instance actually is, and keeps this the single place that knows about
+  // a registration change.
+  {
+    MutexLock lock(&RawPcmTransportRegistryMutex());
+    auto& registry = RawPcmTransportRegistry();
+    if (audio_callback) {
+      registry[adm_borrowed_] = audio_callback;
+    } else {
+      registry.erase(adm_borrowed_);
+    }
+  }
   return 0;
 }
 
