@@ -18,8 +18,13 @@
 #include "api/field_trials.h"
 #include "api/rtc_event_log/rtc_event_log_factory.h"
 #include "api/task_queue/default_task_queue_factory.h"
-#include "api/video_codecs/video_decoder_factory.h"
-#include "api/video_codecs/video_encoder_factory.h"
+#include "api/video_codecs/video_decoder_factory_template.h"
+#include "api/video_codecs/video_decoder_factory_template_libvpx_vp8_adapter.h"
+#include "api/video_codecs/video_decoder_factory_template_libvpx_vp9_adapter.h"
+#include "api/video_codecs/video_encoder_factory_template.h"
+#include "api/video_codecs/video_encoder_factory_template_libvpx_vp8_adapter.h"
+#include "api/video_codecs/video_encoder_factory_template_libvpx_vp9_adapter.h"
+#include "media/engine/simulcast_encoder_adapter.h"
 #include "modules/audio_mixer/audio_mixer_impl.h"
 #include "rffi/api/injectable_network.h"
 #include "rffi/api/media.h"
@@ -37,34 +42,46 @@ namespace webrtc {
 namespace rffi {
 
 #if !defined(WEBRTC_IOS) && !defined(WEBRTC_ANDROID)
-// signal2sip is an audio-only SIP bridge and never negotiates a video
-// codec, so these factories intentionally support zero codecs. This
-// avoids linking the VP8/VP9 encoder/decoder implementations (and the
-// simulcast adapter built on top of them) that RingRTC's upstream
-// default factories pull in for callers that do use video - ~3.7MB of
-// object code with no reachable code path here.
-class NullVideoEncoderFactory : public VideoEncoderFactory {
+// This class adds simulcast support to the base factory and is modeled using
+// the same business logic found in BuiltinVideoEncoderFactory and
+// InternalEncoderFactory.
+class RingRTCVideoEncoderFactory : public VideoEncoderFactory {
  public:
   std::vector<SdpVideoFormat> GetSupportedFormats() const override {
-    return {};
+    return factory_.GetSupportedFormats();
   }
 
   std::unique_ptr<VideoEncoder> Create(const Environment& env,
                                        const SdpVideoFormat& format) override {
+    if (format.IsCodecInList(factory_.GetSupportedFormats())) {
+      if (std::optional<SdpVideoFormat> original_format =
+              FuzzyMatchSdpVideoFormat(factory_.GetSupportedFormats(),
+                                       format)) {
+        // Create a simulcast enabled encoder
+        // The adapter has a passthrough mode for the case that simulcast is not
+        // used, so all responsibility can be delegated to it.
+        return std::make_unique<SimulcastEncoderAdapter>(
+            env, &factory_, nullptr, *original_format);
+      }
+    }
     return nullptr;
   }
-};
 
-class NullVideoDecoderFactory : public VideoDecoderFactory {
- public:
-  std::vector<SdpVideoFormat> GetSupportedFormats() const override {
-    return {};
+  CodecSupport QueryCodecSupport(
+      const SdpVideoFormat& format,
+      std::optional<std::string> scalability_mode) const override {
+    auto original_format =
+        FuzzyMatchSdpVideoFormat(factory_.GetSupportedFormats(), format);
+    return original_format
+               ? factory_.QueryCodecSupport(*original_format, scalability_mode,
+                                            std::nullopt)
+               : VideoEncoderFactory::CodecSupport{.is_supported = false};
   }
 
-  std::unique_ptr<VideoDecoder> Create(const Environment& env,
-                                       const SdpVideoFormat& format) override {
-    return nullptr;
-  }
+ private:
+  VideoEncoderFactoryTemplate<LibvpxVp8EncoderTemplateAdapter,
+                              LibvpxVp9EncoderTemplateAdapter>
+      factory_;
 };
 
 // Cleanup class for ADM. Will drop a reference on the rust side, potentially
@@ -148,9 +165,10 @@ class PeerConnectionFactoryWithOwnedThreads
     dependencies.audio_mixer = AudioMixerImpl::Create();
 
     dependencies.video_encoder_factory =
-        std::make_unique<NullVideoEncoderFactory>();
-    dependencies.video_decoder_factory =
-        std::make_unique<NullVideoDecoderFactory>();
+        std::make_unique<RingRTCVideoEncoderFactory>();
+    dependencies
+        .video_decoder_factory = std::make_unique<VideoDecoderFactoryTemplate<
+        LibvpxVp8DecoderTemplateAdapter, LibvpxVp9DecoderTemplateAdapter>>();
 
     EnableMedia(dependencies);
 
